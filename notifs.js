@@ -27,7 +27,8 @@ const DRY = !!process.env.DRY_RUN;
 const NOW = Date.now();
 const JOUR = 86400000;
 // Comptes test/démo : jamais de notif marketing.
-const EXCLUS = ['bilelosa@gmail.com', 'coursier@daba.ma', 'test@daba.ma', 'demo@daba.ma', 'demo-coursier@daba.ma'];
+// bilelosa@gmail.com RETIRÉ (compte réel du fondateur, doit recevoir le marketing pour voir le rendu).
+const EXCLUS = ['coursier@daba.ma', 'test@daba.ma', 'demo@daba.ma', 'demo-coursier@daba.ma'];
 const MARRAKECH = { lat: 31.63, lng: -7.98 };
 
 const heureMaroc = () =>
