@@ -1,0 +1,14 @@
+{
+  "name": "daba-notifs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Notifications programmees Daba (rappels / reengagement) via cron GitHub Actions.",
+  "scripts": {
+    "start": "node notifs.js",
+    "dry": "DRY_RUN=1 node notifs.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}
