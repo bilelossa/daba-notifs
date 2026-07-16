@@ -3,7 +3,13 @@
 // Tourne via un cron GitHub Actions (gratuit). Il LIT Firestore + Open-Meteo +
 // le calendrier `evenements`, puis envoie via l'API push d'Expo.
 //
-// Anti-doublon : marqueurs `notifs.*` écrits sur chaque fiche utilisateur.
+// Garde-fous :
+//   • Anti-doublon par type : marqueurs `notifs.*` (welcome, meteo=jour, ...).
+//   • Anti-RÉPÉTITION : `notifs.dernier` = signature de la dernière notif envoyée.
+//     On ne renvoie jamais 2 fois DE SUITE la même notification.
+//   • Maroc uniquement : on n'envoie qu'aux clients localisés au Maroc
+//     (position GPS enregistrée par l'app, ou coord de leur dernière demande).
+//
 // DRY_RUN=1  → n'envoie RIEN, affiche juste ce qui partirait (test sûr).
 //
 // Clé service : variable d'env FIREBASE_SERVICE_ACCOUNT (secret GitHub, JSON).
@@ -31,6 +37,9 @@ const JOUR = 86400000;
 const EXCLUS = ['coursier@daba.ma', 'test@daba.ma', 'demo@daba.ma', 'demo-coursier@daba.ma'];
 const MARRAKECH = { lat: 31.63, lng: -7.98 };
 
+// Bounding box du Maroc (mêmes bornes que l'app, constants/geo.ts → estAuMaroc).
+const estAuMaroc = (c) => !!c && c.lat >= 20.5 && c.lat <= 36.2 && c.lng >= -17.5 && c.lng <= -0.5;
+
 const heureMaroc = () =>
   Number(new Date().toLocaleString('en-US', { timeZone: 'Africa/Casablanca', hour: '2-digit', hour12: false }));
 const jourMaroc = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Casablanca' });
@@ -39,9 +48,13 @@ const prenomDe = (u) => (u.prenom || (u.email || '').split('@')[0] || '').trim()
 const envois = []; // { email, to, titre, corps }
 const marqueurs = {}; // uid -> { notifs à fusionner }
 
-function programmer(u, titre, corps, marque) {
+// Programme une notif. `sig` = signature de son contenu : si c'est EXACTEMENT la
+// même que la dernière notif reçue par l'utilisateur → on annule (pas 2× de suite).
+function programmer(u, titre, corps, marque, sig) {
+  if (sig && (u.notifs || {}).dernier === sig) return false;
   envois.push({ email: u.email, to: u.expoPushToken, titre, corps });
-  if (marque) marqueurs[u.id] = { ...(marqueurs[u.id] || {}), ...marque };
+  marqueurs[u.id] = { ...(marqueurs[u.id] || {}), ...(marque || {}), ...(sig ? { dernier: sig } : {}) };
+  return true;
 }
 
 async function envoyerTout() {
@@ -68,7 +81,7 @@ async function envoyerTout() {
       console.error('Push err:', e.message);
     }
   }
-  // Marqueurs anti-doublon (écriture Firestore)
+  // Marqueurs anti-doublon + `dernier` (écriture Firestore)
   for (const [uid, m] of Object.entries(marqueurs)) {
     await db.collection('utilisateurs').doc(uid).set({ notifs: m }, { merge: true }).catch(() => {});
   }
@@ -107,9 +120,27 @@ async function meteoDuJour() {
     if (x.clientId) (parClient[x.clientId] ||= []).push(x);
   });
 
+  // Localisation d'un client : position GPS enregistrée par l'app, sinon coord de
+  // sa dernière demande. Sert à ne notifier QUE les gens au Maroc.
+  const localisationDe = (u) => {
+    if (u.position && typeof u.position.lat === 'number') return u.position;
+    const d = (parClient[u.id] || [])
+      .filter((c) => c.coord && typeof c.coord.lat === 'number')
+      .sort((a, b) => (b.creeLe?.toMillis?.() || 0) - (a.creeLe?.toMillis?.() || 0))[0];
+    return d ? d.coord : null;
+  };
+  // On garde ceux AU Maroc + ceux dont on ignore encore la position (par défaut,
+  // l'app est marocaine). On exclut uniquement ceux localisés HORS Maroc.
+  const clientsMaroc = clients.filter((u) => {
+    const loc = localisationDe(u);
+    return !loc || estAuMaroc(loc);
+  });
+  const horsMaroc = clients.length - clientsMaroc.length;
+  if (horsMaroc) console.log(`${horsMaroc} client(s) hors Maroc exclu(s) du marketing.`);
+
   const meteo = h >= 11 && h <= 18 ? await meteoDuJour() : { pluie: false, chaud: false };
 
-  for (const u of clients) {
+  for (const u of clientsMaroc) {
     const cmds = parClient[u.id] || [];
     const notifs = u.notifs || {};
     const inscritMs = u.creeLe?.toMillis?.() ?? 0;
@@ -117,7 +148,7 @@ async function meteoDuJour() {
 
     // 1) BIENVENUE — inscrit il y a 1-3 j, aucune commande, pas déjà accueilli
     if (h >= 10 && h <= 20 && !notifs.welcome && cmds.length === 0 && ageMs > JOUR && ageMs < 3 * JOUR) {
-      programmer(u, 'Bienvenue sur Daba 👋', `${prenomDe(u)}, ta première demande prend 30 s — on te livre n'importe quoi, même là où les autres ne vont pas.`, { welcome: true });
+      programmer(u, 'Bienvenue sur Daba 👋', `${prenomDe(u)}, ta première demande prend 30 s — on te livre n'importe quoi, même là où les autres ne vont pas.`, { welcome: true }, 'welcome');
       continue;
     }
 
@@ -129,24 +160,24 @@ async function meteoDuJour() {
         .map((c) => ({ t: c.termineeLe?.toMillis?.() || c.creeLe?.toMillis?.() || 0, nom: c.titre || 'ton resto' }))
         .sort((a, b) => b.t - a.t)[0];
       if (NOW - derniere.t > 4 * JOUR && NOW - (notifs.recommande || 0) > 7 * JOUR) {
-        programmer(u, 'Envie de te régaler ? 🍔', `Re-commander chez ${derniere.nom} ? En 2 taps sur Daba.`, { recommande: NOW });
+        programmer(u, 'Envie de te régaler ? 🍔', `Re-commander chez ${derniere.nom} ? En 2 taps sur Daba.`, { recommande: NOW }, 'recommande');
         continue;
       }
     }
 
-    // 3) MÉTÉO — pluie / chaleur, 1 fois par jour max
+    // 3) MÉTÉO — pluie / chaleur, 1 fois par jour max (et jamais 2 jours de suite : cf. `dernier`)
     if ((meteo.pluie || meteo.chaud) && notifs.meteo !== jour) {
       const [titre, corps] = meteo.pluie
         ? ['Il pleut ☔', 'Reste au chaud — fais-toi livrer ce que tu veux avec Daba.']
         : ['Trop chaud pour sortir ? 🥤', "On s'en occupe : commande sur Daba, on te livre."];
-      programmer(u, titre, corps, { meteo: jour });
+      programmer(u, titre, corps, { meteo: jour }, 'meteo:' + (meteo.pluie ? 'pluie' : 'chaud'));
       continue;
     }
 
     // 4) RÉACTIVATION — aucune activité depuis 14 j, pas relancé depuis 30 j (le soir)
     const derniereActivite = Math.max(inscritMs, ...cmds.map((c) => c.creeLe?.toMillis?.() || 0));
     if (h >= 17 && h <= 19 && NOW - derniereActivite > 14 * JOUR && NOW - (notifs.reactive || 0) > 30 * JOUR) {
-      programmer(u, 'Ça fait un moment ! 👀', `${prenomDe(u)}, ta prochaine livraison t'attend. Un petit creux ?`, { reactive: NOW });
+      programmer(u, 'Ça fait un moment ! 👀', `${prenomDe(u)}, ta prochaine livraison t'attend. Un petit creux ?`, { reactive: NOW }, 'reactive');
       continue;
     }
   }
@@ -158,15 +189,17 @@ async function meteoDuJour() {
     if (!debut) continue;
     const dans = debut - NOW;
     if (dans > 0 && dans < 2.5 * 3600 * 1000) {
-      for (const u of clients) {
-        envois.push({
-          email: u.email,
-          to: u.expoPushToken,
-          titre: ev.data().titre || '⚽ Ce soir',
-          corps: ev.data().message || "Commande tes snacks avant le coup d'envoi sur Daba.",
-        });
+      const sig = 'match:' + ev.id;
+      const titre = ev.data().titre || '⚽ Ce soir';
+      const corps = ev.data().message || "Commande tes snacks avant le coup d'envoi sur Daba.";
+      let n = 0;
+      for (const u of clientsMaroc) {
+        if ((u.notifs || {}).dernier === sig) continue; // déjà reçu cet évènement
+        envois.push({ email: u.email, to: u.expoPushToken, titre, corps });
+        marqueurs[u.id] = { ...(marqueurs[u.id] || {}), dernier: sig };
+        n++;
       }
-      if (DRY) console.log(`[DRY_RUN] Évènement « ${ev.data().titre} » → ${clients.length} clients`);
+      if (DRY) console.log(`[DRY_RUN] Évènement « ${titre} » → ${n} clients (au Maroc)`);
       else await ev.ref.update({ envoye: true }).catch(() => {});
     }
   }
