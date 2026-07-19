@@ -102,6 +102,82 @@ async function meteoDuJour() {
   }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RAPPELS DE VALIDATION (transactionnels, indépendants du marketing).
+// Ils partent même si l'app est fermée — c'est tout l'intérêt : l'app ne détecte
+// l'éloignement que lorsqu'elle est ouverte.
+//   • Coursier : les deux se sont rencontrés, il est reparti, mais la course est
+//     toujours « en cours » → il a oublié de valider.
+//   • Client : le coursier a validé (« livrée »), le client ne confirme pas.
+// Anti-doublon par marqueurs sur la DEMANDE (pas sur l'utilisateur).
+// ─────────────────────────────────────────────────────────────────────────────
+const MIN = 60000;
+const RAPPEL_COURSIER_MS = 15 * MIN; // 15 min après la rencontre
+const RAPPEL_CLIENT_1_MS = 20 * MIN; // 20 min après « livrée »
+const RAPPEL_CLIENT_2_MS = 120 * MIN; // puis 2 h
+// Au-delà, on ne relance plus : inutile de réveiller une commande d'il y a
+// plusieurs jours restée ouverte (le rappel n'aurait plus aucun sens).
+const RAPPEL_AGE_MAX_MS = 24 * 60 * MIN;
+
+async function jetonDe(uid) {
+  if (!uid) return null;
+  const d = await db.collection('utilisateurs').doc(uid).get().catch(() => null);
+  const t = d && d.exists ? d.data().expoPushToken : null;
+  return t && String(t).startsWith('ExponentPushToken') ? t : null;
+}
+
+async function rappelsValidation() {
+  const snap = await db
+    .collection('demandes')
+    .where('statut', 'in', ['en cours', 'livrée'])
+    .get()
+    .catch(() => ({ docs: [] }));
+
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    const ms = (k) => (d[k] && d[k].toMillis ? d[k].toMillis() : 0);
+
+    // ── Coursier : il a oublié de valider ──
+    if (d.statut === 'en cours' && ms('rencontreLe') && !d.rappelCoursier) {
+      const age = NOW - ms('rencontreLe');
+      if (age > RAPPEL_COURSIER_MS && age < RAPPEL_AGE_MAX_MS) {
+        const to = await jetonDe(d.coursierId);
+        if (to) {
+          envois.push({
+            email: 'coursier:' + d.coursierId,
+            to,
+            titre: '📦 Tu as livré le client ?',
+            corps: `Valide la livraison de « ${d.titre} » dans Daba pour clôturer la course.`,
+          });
+        }
+        if (!DRY) await doc.ref.update({ rappelCoursier: true }).catch(() => {});
+      }
+    }
+
+    // ── Client : le coursier a validé, lui n'a pas confirmé ──
+    if (d.statut === 'livrée' && ms('livreeLe')) {
+      const age = NOW - ms('livreeLe');
+      const rang = d.rappelClient || 0; // 0 = aucun, 1 = premier fait
+      const du =
+        age < RAPPEL_AGE_MAX_MS &&
+        ((rang === 0 && age > RAPPEL_CLIENT_1_MS) || (rang === 1 && age > RAPPEL_CLIENT_2_MS));
+      if (du) {
+        const to = await jetonDe(d.clientId);
+        if (to) {
+          envois.push({
+            email: 'client:' + d.clientId,
+            to,
+            titre: '✅ Tu as bien été livré ?',
+            corps: `Confirme la livraison de « ${d.titre} » pour clôturer ta commande.`,
+          });
+        }
+        if (!DRY) await doc.ref.update({ rappelClient: rang + 1 }).catch(() => {});
+      }
+    }
+  }
+}
+
 (async () => {
   const h = heureMaroc();
   const jour = jourMaroc();
@@ -203,6 +279,9 @@ async function meteoDuJour() {
       else await ev.ref.update({ envoye: true }).catch(() => {});
     }
   }
+
+  // Rappels de validation (transactionnels) — indépendants du marketing.
+  await rappelsValidation();
 
   await envoyerTout();
   process.exit(0);
