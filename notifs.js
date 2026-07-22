@@ -64,6 +64,16 @@ async function envoyerTout() {
     body: e.corps,
     sound: 'default',
     priority: 'high',
+    // Relance de COMMANDE → aussi voyante que le push d'origine de l'app :
+    // canal Android importance max + vibreur, « Temps fort » iOS, et le tap
+    // ouvre directement la commande (data.demandeId).
+    ...(e.commande && {
+      channelId: 'commandes',
+      vibrate: [0, 400, 200, 400, 200, 400],
+      sticky: true,
+      interruptionLevel: 'time-sensitive', // ⚠️ avec tiret — sinon Expo rejette TOUT
+      data: { demandeId: e.commande },
+    }),
   }));
   if (DRY) {
     console.log(`\n[DRY_RUN] ${messages.length} notif(s) qui PARTIRAIENT :`);
@@ -178,6 +188,59 @@ async function rappelsValidation() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RELANCES COURSIERS (transactionnel) : une demande toujours « créée » est
+// re-poussée à TOUS les coursiers éligibles à ~15 min puis ~30 min (l'app du
+// client fait déjà +2 et +4 min ; ce cron en */15 prend le relais app fermée —
+// seuils 12/27 pour que le passage suivant du cron tombe dedans).
+// Exclusions identiques à l'app : parrain du client (anti-fraude), rejetés,
+// comptes test (demandes demoPour ignorées). Au-delà d'1 h : la demande est
+// expirée pour les coursiers → plus aucune relance.
+// ─────────────────────────────────────────────────────────────────────────────
+const RELANCE_1_MS = 12 * MIN; // vise le passage ~15 min
+const RELANCE_2_MS = 27 * MIN; // vise le passage ~30 min
+const EXPIRATION_MS = 60 * MIN;
+
+async function relancesCoursiers() {
+  const snap = await db.collection('demandes').where('statut', '==', 'créée').get().catch(() => ({ docs: [] }));
+  const aRelancer = snap.docs.filter((doc) => {
+    const d = doc.data();
+    if (d.demoPour || d.contreOffre) return false; // test / négociation en cours
+    const cree = d.creeLe && d.creeLe.toMillis ? d.creeLe.toMillis() : 0;
+    const age = NOW - cree;
+    if (!cree || age >= EXPIRATION_MS) return false;
+    const rang = d.relanceCoursiers || 0;
+    return (rang === 0 && age > RELANCE_1_MS) || (rang === 1 && age > RELANCE_2_MS);
+  });
+  if (!aRelancer.length) return;
+
+  // Coursiers éligibles (une seule lecture pour toutes les demandes).
+  const csnap = await db.collection('utilisateurs').where('role', '==', 'coursier').get();
+  const coursiers = csnap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .filter(
+      (c) =>
+        c.expoPushToken &&
+        String(c.expoPushToken).startsWith('ExponentPushToken') &&
+        c.statutCoursier !== 'rejete' &&
+        !EXCLUS.includes((c.email || '').toLowerCase())
+    );
+
+  for (const doc of aRelancer) {
+    const d = doc.data();
+    const rang = d.relanceCoursiers || 0;
+    const [titre, corps] =
+      rang === 0
+        ? [`💸 ${d.prix} DH t'attendent`, `« ${d.titre} » n'a toujours pas de coursier — premier arrivé, premier servi.`]
+        : [`🚨 Dernière chance · ${d.prix} DH`, `« ${d.titre} » expire bientôt — accepte-la maintenant dans Daba.`];
+    for (const c of coursiers) {
+      if (c.id === d.parrainCoursierId || c.id === d.clientId) continue;
+      envois.push({ email: c.email, to: c.expoPushToken, titre, corps, commande: doc.id });
+    }
+    if (!DRY) await doc.ref.update({ relanceCoursiers: rang + 1 }).catch(() => {});
+  }
+}
+
 (async () => {
   const h = heureMaroc();
   const jour = jourMaroc();
@@ -282,6 +345,9 @@ async function rappelsValidation() {
 
   // Rappels de validation (transactionnels) — indépendants du marketing.
   await rappelsValidation();
+
+  // Relances coursiers sur les demandes sans preneur (~15 et ~30 min).
+  await relancesCoursiers();
 
   await envoyerTout();
   process.exit(0);
