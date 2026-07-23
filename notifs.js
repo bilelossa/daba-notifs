@@ -249,7 +249,9 @@ async function relancesCoursiers() {
   const usnap = await db.collection('utilisateurs').where('role', '==', 'client').get();
   const clients = usnap.docs
     .map((d) => ({ id: d.id, ...d.data() }))
-    .filter((u) => u.expoPushToken && !EXCLUS.includes((u.email || '').toLowerCase()));
+    // `invite` = compte fantôme du mode invité (jamais de marketing : pas
+    // d'e-mail, pas de consentement — il n'a même pas créé de compte).
+    .filter((u) => u.expoPushToken && !u.invite && !EXCLUS.includes((u.email || '').toLowerCase()));
 
   // Commandes groupées par client
   const dsnap = await db.collection('demandes').get();
